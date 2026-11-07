@@ -376,6 +376,55 @@ class FrameTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await task, [1, 65534])
 
+    async def test_modbus_exception_response_becomes_huawei_read_exception(self):
+        # Regression: with tmodbus >= 0.6 the transport raised TypeError here, which
+        # escaped huawei-solar's ReadException handling and silently killed polling.
+        from huawei_solar.modbus_client import AsyncHuaweiSolarClient
+
+        session = ReverseModbusSession(
+            asyncio.StreamReader(),
+            FakeWriter(),
+            request_timeout=1,
+            poll_interval=10,
+            publisher=None,
+            state_callback=ignore_states,
+        )
+        writer = session.writer
+        client = AsyncHuaweiSolarClient(session.transport, unit_id=3)
+        task = asyncio.create_task(client.get(rn.STORAGE_CAPACITY_CONTROL_MODE))
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if writer.data:
+                break
+        transaction_id = struct.unpack(">H", writer.data[:2])[0]
+        session._dispatch(ModbusFrame(transaction_id, 0, 3, b"\x83\x03"))
+        with self.assertRaises(ReadException) as raised:
+            await task
+        self.assertEqual(raised.exception.modbus_exception_code, 3)
+
+    async def test_master_loop_crash_is_logged_and_closes_connection(self):
+        session = ReverseModbusSession(
+            asyncio.StreamReader(),
+            FakeWriter(),
+            request_timeout=1,
+            poll_interval=10,
+            publisher=None,
+            state_callback=ignore_states,
+        )
+
+        async def crash():
+            raise RuntimeError("boom")
+
+        task = asyncio.create_task(crash())
+        task.add_done_callback(session._on_master_loop_done)
+        with self.assertLogs(level="ERROR") as logs:
+            with self.assertRaises(RuntimeError):
+                await task
+            await asyncio.sleep(0)
+        self.assertTrue(session.writer.closing)
+        self.assertIn("RuntimeError: boom", session.last_poll_error)
+        self.assertIn("master loop", logs.output[0])
+
     async def test_command_write_uses_library_register_and_scaling(self):
         reader = asyncio.StreamReader()
         writer = FakeWriter()

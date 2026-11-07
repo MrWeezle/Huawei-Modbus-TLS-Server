@@ -166,8 +166,10 @@ CI (`.github/workflows/validate.yml`) runs HACS validation, Hassfest, the genera
   in sync.
 - Hassfest validates `manifest.json`. Its `requirements` (what HA installs:
   `huawei-solar==3.0.6`, `tmodbus>=0.6.2`) are separate from `requirements.txt` (used by
-  standalone and CI, currently `tmodbus==0.4.1`). When changing dependencies, update
-  and check both.
+  standalone and CI, `tmodbus==0.6.2`). When changing dependencies, update and check
+  both. The tmodbus API changes between minor versions. For example, 0.6 changed the
+  constructors of the Modbus response error classes, so build them only through
+  `modbus_response_error()`.
 
 ## Conventions
 

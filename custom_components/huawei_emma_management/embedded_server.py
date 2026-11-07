@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from huawei_solar.registers import REGISTERS
 from tmodbus.exceptions import (
     InvalidResponseError,
     ModbusConnectionError,
+    TModbusError,
     UnknownModbusResponseError,
     error_code_to_exception_map,
 )
@@ -536,6 +538,21 @@ class HomeAssistantPublisher:
 RT = TypeVar("RT")
 
 
+def modbus_response_error(exception_code: int, function_code: int) -> Exception:
+    """Build tmodbus' exception for a Modbus exception response.
+
+    tmodbus 0.4 constructs known response errors as ``(error_code, function_code)``;
+    0.6 and newer take only ``function_code`` because the code is a class attribute.
+    Home Assistant installs whatever the manifest allows, so support both.
+    """
+    error_class = error_code_to_exception_map.get(exception_code)
+    if error_class is None:
+        return UnknownModbusResponseError(exception_code, function_code)
+    if "error_code" in inspect.signature(error_class).parameters:
+        return error_class(exception_code, function_code)
+    return error_class(function_code)
+
+
 class ReverseConnectionTransport(AsyncBaseTransport):
     """tmodbus transport over the TLS socket that EMMA opened toward us."""
 
@@ -558,12 +575,9 @@ class ReverseConnectionTransport(AsyncBaseTransport):
         try:
             response = await self.session.request(unit_id, pdu.encode_request())
         except ModbusExceptionResponse as error:
-            function_code = error.function_code & 0x7F
-            error_class = error_code_to_exception_map.get(
-                error.exception_code,
-                UnknownModbusResponseError,
-            )
-            raise error_class(error.exception_code, function_code) from error
+            raise modbus_response_error(
+                error.exception_code, error.function_code & 0x7F
+            ) from error
         except ConnectionError as error:
             raise ModbusConnectionError(str(error)) from error
         except ModbusProtocolError as error:
@@ -679,6 +693,7 @@ class ReverseModbusSession:
 
     async def run(self) -> None:
         master_task = asyncio.create_task(self._master_loop(), name=f"master-{self.peer}")
+        master_task.add_done_callback(self._on_master_loop_done)
         try:
             while True:
                 frame = await read_modbus_frame(self.reader)
@@ -691,7 +706,7 @@ class ReverseModbusSession:
         finally:
             self._closed = True
             master_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await master_task
             for future in self._pending.values():
                 if not future.done():
@@ -701,6 +716,22 @@ class ReverseModbusSession:
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
+
+    def _on_master_loop_done(self, task: asyncio.Task[None]) -> None:
+        """Never let polling die silently while the EMMA socket stays open."""
+        if task.cancelled() or task.exception() is None:
+            return
+        error = task.exception()
+        log.error(
+            "EMMA master loop for %s crashed; closing the connection so EMMA "
+            "reconnects: %s: %s",
+            self.peer,
+            type(error).__name__,
+            error,
+            exc_info=error,
+        )
+        self.last_poll_error = f"{type(error).__name__}: {error}"
+        self.writer.close()
 
     def _dispatch(self, frame: ModbusFrame) -> None:
         future = self._pending.pop(frame.transaction_id, None)
@@ -956,8 +987,12 @@ class ReverseModbusSession:
                 getattr(self.device, "serial_number", "-"),
                 getattr(self.device, "software_version", "-"),
             )
-        except (TimeoutError, ConnectionError, HuaweiSolarException) as error:
-            log.warning("huawei-solar device discovery failed; using generic client: %s", error)
+        except Exception as error:  # noqa: BLE001 - optional discovery must not stop polling
+            log.warning(
+                "huawei-solar device discovery failed; using generic client: %s: %s",
+                type(error).__name__,
+                error,
+            )
 
         for topology_device in self.topology_devices:
             role = topology_device["role"]
@@ -981,11 +1016,13 @@ class ReverseModbusSession:
                     device.model_name,
                     getattr(device, "serial_number", topology_device.get("serial_number") or "-"),
                 )
-            except (TimeoutError, ConnectionError, HuaweiSolarException) as error:
+            except Exception as error:  # noqa: BLE001 - optional discovery must not stop polling
                 log.warning(
-                    "Could not initialize %s subdevice unit=%d; individual register access will be used: %s",
+                    "Could not initialize %s subdevice unit=%d; individual register "
+                    "access will be used: %s: %s",
                     role,
                     unit_id,
+                    type(error).__name__,
                     error,
                 )
 
@@ -1039,6 +1076,7 @@ class ReverseModbusSession:
                     ModbusProtocolError,
                     ConnectionError,
                     HuaweiSolarException,
+                    TModbusError,
                 ) as error:
                     cycle_error = error
                     self.last_poll_error = str(error)
