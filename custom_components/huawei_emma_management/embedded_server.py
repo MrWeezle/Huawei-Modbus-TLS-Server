@@ -538,6 +538,32 @@ class HomeAssistantPublisher:
 RT = TypeVar("RT")
 
 
+def split_non_overlapping_registers(names: list[str]) -> list[list[str]]:
+    """Split register names into groups whose Modbus address ranges never overlap.
+
+    huawei-solar's ``batch_update`` requires strictly increasing, non-overlapping
+    registers, but its catalog has aliases at the same address (for example
+    ``grid_voltage`` and ``line_voltage_A_B`` for single- and three-phase inverters).
+    Aliases go into a later group and are read separately.
+    """
+    groups: list[list[str]] = []
+    group_ends: list[int] = []
+    for name in sorted(
+        names, key=lambda item: (ENTITY_CATALOG[item].address, ENTITY_CATALOG[item].length)
+    ):
+        start = ENTITY_CATALOG[name].address
+        end = start + ENTITY_CATALOG[name].length - 1
+        for index, group_end in enumerate(group_ends):
+            if start > group_end:
+                groups[index].append(name)
+                group_ends[index] = end
+                break
+        else:
+            groups.append([name])
+            group_ends.append(end)
+    return groups
+
+
 def modbus_response_error(exception_code: int, function_code: int) -> Exception:
     """Build tmodbus' exception for a Modbus exception response.
 
@@ -1081,6 +1107,13 @@ class ReverseModbusSession:
                     cycle_error = error
                     self.last_poll_error = str(error)
                     log.warning("EMMA poll group=%s failed: %s", group, error)
+                except Exception as error:  # noqa: BLE001 - one bad group must not stop polling
+                    cycle_error = error
+                    self.last_poll_error = f"{type(error).__name__}: {error}"
+                    log.exception(
+                        "EMMA poll group=%s failed unexpectedly; other groups continue",
+                        group,
+                    )
 
             if cycle_error is None:
                 self.last_poll_error = None
@@ -1144,7 +1177,10 @@ class ReverseModbusSession:
                 log.debug("Decoded structured register %s value=%s", names[0], value)
                 return {names[0]: decoded}
             if device is not None:
-                return await device.batch_update(names)
+                batched: dict[str, Result[Any]] = {}
+                for group in split_non_overlapping_registers(names):
+                    batched.update(await device.batch_update(group))
+                return batched
             result: dict[str, Result[Any]] = {}
             for register_name in names:
                 result[register_name] = await client.get(register_name)
