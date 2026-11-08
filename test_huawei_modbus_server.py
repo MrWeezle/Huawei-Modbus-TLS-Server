@@ -555,6 +555,52 @@ class FrameTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "rated power"):
             await session.set_register_value(register_name, 10100)
 
+    async def test_aliased_registers_are_never_batched_together(self):
+        # Regression: enabling every entity put aliases such as grid_voltage and
+        # line_voltage_A_B (both address 32066) into one huawei-solar batch_update,
+        # which raises "Requested registers must be in monotonically increasing order".
+        class StrictDevice:
+            def __init__(self):
+                self.calls = []
+
+            async def batch_update(self, names):
+                self.calls.append(list(names))
+                ordered = sorted(names, key=lambda name: REGISTERS[name].register)
+                for previous, current in zip(ordered, ordered[1:]):
+                    end = REGISTERS[previous].register + REGISTERS[previous].length
+                    if REGISTERS[current].register < end:
+                        raise ValueError(
+                            "Requested registers must be in monotonically increasing order"
+                        )
+                return {name: Result(0, None) for name in names}
+
+        session = ReverseModbusSession(
+            asyncio.StreamReader(),
+            FakeWriter(),
+            request_timeout=1,
+            publisher=None,
+            state_callback=ignore_states,
+        )
+        device = StrictDevice()
+        session.clients_by_role["inverter"] = object()
+        session.devices_by_role["inverter"] = device
+        names = [
+            name
+            for name, description in ENTITY_CATALOG.items()
+            if description.client_role == "inverter" and description.format is None
+        ]
+        self.assertIn(str(rn.GRID_VOLTAGE), names)
+        self.assertIn(str(rn.LINE_VOLTAGE_A_B), names)
+
+        result = await session._read_registers_with_fallback(names)
+
+        self.assertEqual(set(result), set(names))
+        self.assertGreater(len(device.calls), 1)
+        for call in device.calls:
+            self.assertFalse(
+                {str(rn.GRID_VOLTAGE), str(rn.LINE_VOLTAGE_A_B)} <= set(call)
+            )
+
 
 class DecoderTests(unittest.TestCase):
     def test_friendly_names_do_not_expand_ac_inside_active(self):
